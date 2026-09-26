@@ -17,6 +17,7 @@ from curl_cffi import requests
 KST = timezone(timedelta(hours=9))
 WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
 CGV_API = "https://cgv.co.kr/api/v1/booking"
+CGV_SHOWTIMES_FALLBACK_URL = "https://cgv.co.kr/cnm/atkt/searchMovScnInfo"
 CGV_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie?movNo={movie_no}&siteNo={site_no}"
 CGV_COMPANY_CODE = "A420"
 
@@ -48,12 +49,14 @@ def decode_json_response(response: Any) -> dict[str, Any]:
     return json.loads(response.content.decode("utf-8-sig"))
 
 
-def api_get(session: Any, path: str, params: dict[str, str], tries: int = 3) -> list[dict[str, Any]]:
+def request_data(
+    session: Any, url: str, params: dict[str, str], tries: int = 3
+) -> list[dict[str, Any]]:
     last_error = "unknown error"
     for attempt in range(tries):
         try:
             response = session.get(
-                f"{CGV_API}/{path}", params=params, headers=HEADERS, timeout=20
+                url, params=params, headers=HEADERS, timeout=20
             )
             if response.status_code == 200:
                 body = decode_json_response(response)
@@ -75,7 +78,11 @@ def api_get(session: Any, path: str, params: dict[str, str], tries: int = 3) -> 
         if attempt < tries - 1:
             time.sleep(2 * (attempt + 1))
 
-    raise RuntimeError(f"CGV {path} request failed: {last_error}")
+    raise RuntimeError(f"CGV request failed ({url}): {last_error}")
+
+
+def api_get(session: Any, path: str, params: dict[str, str], tries: int = 3) -> list[dict[str, Any]]:
+    return request_data(session, f"{CGV_API}/{path}", params, tries)
 
 
 def fetch_open_dates(session: Any) -> list[str]:
@@ -88,18 +95,31 @@ def fetch_open_dates(session: Any) -> list[str]:
 
 
 def fetch_showtimes(session: Any, ymd: str) -> list[dict[str, Any]]:
-    return api_get(
-        session,
-        "searchSchByMov",
-        {
-            "coCd": CGV_COMPANY_CODE,
-            "siteNo": SITE_NO,
-            "scnYmd": ymd,
-            "movNo": MOVIE_NO,
-            "rtctlScopCd": "08",
-        },
-        tries=2,
-    )
+    params = {
+        "coCd": CGV_COMPANY_CODE,
+        "siteNo": SITE_NO,
+        "scnYmd": ymd,
+        "movNo": MOVIE_NO,
+        "rtctlScopCd": "08",
+    }
+    try:
+        return api_get(session, "searchSchByMov", params, tries=2)
+    except RuntimeError as primary_error:
+        # The movie-specific route is intermittently blocked on hosted runners.
+        # This is the theater/date route used by the current CGV booking page.
+        log(f"Primary showtime route blocked; trying browser route: {primary_error}")
+        rows = request_data(
+            session,
+            CGV_SHOWTIMES_FALLBACK_URL,
+            {
+                "coCd": CGV_COMPANY_CODE,
+                "siteNo": SITE_NO,
+                "scnYmd": ymd,
+                "rtctlScopCd": "08",
+            },
+            tries=2,
+        )
+        return [row for row in rows if str(row.get("movNo") or "") == MOVIE_NO]
 
 
 def is_target_format(row: dict[str, Any], keyword: str = FORMAT_KEYWORD) -> bool:
