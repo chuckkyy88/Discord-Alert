@@ -50,7 +50,9 @@ jobs:
           CGV_MOV_NO: "30001323"
           CGV_MOV_NAME: "오디세이"
           CGV_FORMAT_KEYWORD: "IMAX"
-          CGV_LOOP_INTERVAL: "60"
+          CGV_LOOKAHEAD_DAYS: "14"
+          CGV_IMAX_MIN_SEATS: "500"
+          CGV_LOOP_INTERVAL: "450"
           CGV_LOOP_DURATION_MIN: "340"
           CGV_TEST_ALERT: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_alert) && '1' || '0' }}
         run: python watcher.py
