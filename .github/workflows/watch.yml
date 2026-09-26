@@ -1,0 +1,63 @@
+name: CGV 용산 IMAX 감시
+
+on:
+  schedule:
+    # 예약 실행은 감시 잡을 이어 붙이는 트리거로만 사용합니다.
+    # 실제 감시는 잡 안에서 1분 간격으로 약 5시간 40분 동안 수행합니다.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Discord 테스트 알림만 1건 보내기"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cgv-yongsan-imax-${{ (github.event_name == 'workflow_dispatch' && inputs.test_alert) && 'test' || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 이전 감시 상태 복원
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: cgv-yongsan-imax-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cgv-yongsan-imax-state-v1-
+
+      - name: 감시 실행
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+          CGV_SITE_NO: "0013"
+          CGV_SITE_NAME: "CGV 용산아이파크몰"
+          CGV_MOV_NO: "30001323"
+          CGV_MOV_NAME: "오디세이"
+          CGV_FORMAT_KEYWORD: "IMAX"
+          CGV_LOOP_INTERVAL: "60"
+          CGV_LOOP_DURATION_MIN: "340"
+          CGV_TEST_ALERT: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_alert) && '1' || '0' }}
+        run: python watcher.py
+
+      - name: 감시 상태 저장
+        if: always() && !(github.event_name == 'workflow_dispatch' && inputs.test_alert)
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: cgv-yongsan-imax-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
