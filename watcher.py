@@ -215,7 +215,7 @@ def send_discord(payload: dict[str, Any]) -> bool:
                 except Exception:
                     retry_after = 0
                 if retry_after > MAX_RETRY_WAIT_SECONDS:
-                    log(f"Discord rate limited for {retry_after*.1f}s; retry next cycle")
+                    log(f"Discord rate limited for {retry_after:.1f}s; retry next cycle")
                     return False
                 time.sleep(max(1.0, retry_after + 0.5))
                 continue
