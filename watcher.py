@@ -16,16 +16,16 @@ from curl_cffi import requests
 
 KST = timezone(timedelta(hours=9))
 WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
-CGV_API = "https://cgv.co.kr/api/v1/booking"
-CGV_SHOWTIMES_FALLBACK_URL = "https://cgv.co.kr/cnm/atkt/searchMovScnInfo"
+CGV_TIMETABLE_PROXY_URL = "https://mcp.aka.page/api/cgv/timetable"
 CGV_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie?movNo={movie_no}&siteNo={site_no}"
-CGV_COMPANY_CODE = "A420"
 
 SITE_NO = os.environ.get("CGV_SITE_NO", "0013")
 SITE_NAME = os.environ.get("CGV_SITE_NAME", "CGV 용산아이파크몰")
 MOVIE_NO = os.environ.get("CGV_MOV_NO", "30001323")
 MOVIE_NAME = os.environ.get("CGV_MOV_NAME", "오디세이")
 FORMAT_KEYWORD = os.environ.get("CGV_FORMAT_KEYWORD", "IMAX")
+LOOKAHEAD_DAYS = int(os.environ.get("CGV_LOOKAHEAD_DAYS", "14"))
+IMAX_MIN_SEATS = int(os.environ.get("CGV_IMAX_MIN_SEATS", "500"))
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID = os.environ.get("DISCORD_USER_ID", "").strip()
 STATE_FILE = Path(os.environ.get("CGV_STATE_FILE", Path(__file__).with_name("state.json")))
@@ -35,6 +35,11 @@ MAX_RETRY_WAIT_SECONDS = 120
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
     "Origin": "https://cgv.co.kr",
     "Referer": "https://cgv.co.kr/cnm/movieBook/movie",
 }
@@ -49,77 +54,62 @@ def decode_json_response(response: Any) -> dict[str, Any]:
     return json.loads(response.content.decode("utf-8-sig"))
 
 
-def request_data(
-    session: Any, url: str, params: dict[str, str], tries: int = 3
-) -> list[dict[str, Any]]:
-    last_error = "unknown error"
-    for attempt in range(tries):
-        try:
-            response = session.get(
-                url, params=params, headers=HEADERS, timeout=20
-            )
-            if response.status_code == 200:
-                body = decode_json_response(response)
-                if body.get("statusCode") in (0, "0"):
-                    data = body.get("data") or []
-                    if isinstance(data, list):
-                        return data
-                    last_error = "response data is not a list"
-                else:
-                    last_error = (
-                        f"statusCode={body.get('statusCode')} "
-                        f"{body.get('statusMessage', '')}"
-                    ).strip()
-            else:
-                last_error = f"HTTP {response.status_code}"
-        except Exception as exc:  # Network and response parsing failures.
-            last_error = f"{type(exc).__name__}: {exc}"
-
-        if attempt < tries - 1:
-            time.sleep(2 * (attempt + 1))
-
-    raise RuntimeError(f"CGV request failed ({url}): {last_error}")
-
-
-def api_get(session: Any, path: str, params: dict[str, str], tries: int = 3) -> list[dict[str, Any]]:
-    return request_data(session, f"{CGV_API}/{path}", params, tries)
-
-
-def fetch_open_dates(session: Any) -> list[str]:
-    rows = api_get(
-        session,
-        "searchSiteScnscYmdListByMov",
-        {"coCd": CGV_COMPANY_CODE, "siteNo": SITE_NO, "movNo": MOVIE_NO},
-    )
-    return sorted({str(row["scnYmd"]) for row in rows if row.get("scnYmd")})
+def fetch_open_dates(_session: Any) -> list[str]:
+    """Return the dates to inspect without making an extra CGV request."""
+    today = datetime.now(KST).date()
+    return [
+        (today + timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in range(LOOKAHEAD_DAYS)
+    ]
 
 
 def fetch_showtimes(session: Any, ymd: str) -> list[dict[str, Any]]:
-    params = {
-        "coCd": CGV_COMPANY_CODE,
-        "siteNo": SITE_NO,
-        "scnYmd": ymd,
-        "movNo": MOVIE_NO,
-        "rtctlScopCd": "08",
-    }
-    try:
-        return api_get(session, "searchSchByMov", params, tries=2)
-    except RuntimeError as primary_error:
-        # The movie-specific route is intermittently blocked on hosted runners.
-        # This is the theater/date route used by the current CGV booking page.
-        log(f"Primary showtime route blocked; trying browser route: {primary_error}")
-        rows = request_data(
-            session,
-            CGV_SHOWTIMES_FALLBACK_URL,
+    """Fetch normalized CGV rows through a public cache/proxy.
+
+    CGV blocks GitHub-hosted runner IPs with HTTP 403.  The public endpoint is
+    rate-limited, so the workflow checks a 14-day window every 7.5 minutes.
+    """
+    response = session.get(
+        CGV_TIMETABLE_PROXY_URL,
+        params={
+            "playDate": ymd,
+            "theaterCode": SITE_NO,
+            "movieCode": MOVIE_NO,
+            "limit": "50",
+        },
+        headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"CGV timetable proxy failed: HTTP {response.status_code}")
+
+    body = decode_json_response(response)
+    if body.get("success") is not True:
+        raise RuntimeError(f"CGV timetable proxy error: {body.get('error') or body}")
+    rows = ((body.get("data") or {}).get("timetable") or [])
+    if not isinstance(rows, list):
+        raise RuntimeError("CGV timetable proxy returned an invalid timetable")
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("movieCode") or "") != MOVIE_NO:
+            continue
+        total = row.get("totalSeats")
+        normalized.append(
             {
-                "coCd": CGV_COMPANY_CODE,
-                "siteNo": SITE_NO,
-                "scnYmd": ymd,
-                "rtctlScopCd": "08",
-            },
-            tries=2,
+                "scnYmd": str(row.get("playDate") or ymd),
+                "scnsrtTm": str(row.get("startTime") or "").replace(":", ""),
+                "scnendTm": str(row.get("endTime") or "").replace(":", ""),
+                "frSeatCnt": row.get("remainingSeats"),
+                "cpSeatCnt": total,
+                "movNo": row.get("movieCode"),
+                "movNm": row.get("movieName"),
+                "siteNo": row.get("theaterCode"),
+                "siteNm": row.get("theaterName"),
+                "_proxyImax": isinstance(total, (int, float)) and total >= IMAX_MIN_SEATS,
+            }
         )
-        return [row for row in rows if str(row.get("movNo") or "") == MOVIE_NO]
+    return normalized
 
 
 def is_target_format(row: dict[str, Any], keyword: str = FORMAT_KEYWORD) -> bool:
@@ -133,7 +123,7 @@ def is_target_format(row: dict[str, Any], keyword: str = FORMAT_KEYWORD) -> bool
         "engProdNm",
     )
     haystack = " ".join(str(row.get(field) or "") for field in format_fields)
-    return keyword.casefold() in haystack.casefold()
+    return bool(row.get("_proxyImax")) or keyword.casefold() in haystack.casefold()
 
 
 def format_date(ymd: str) -> str:
@@ -225,7 +215,7 @@ def send_discord(payload: dict[str, Any]) -> bool:
                 except Exception:
                     retry_after = 0
                 if retry_after > MAX_RETRY_WAIT_SECONDS:
-                    log(f"Discord rate limited for {retry_after:.1f}s; retry next cycle")
+                    log(f"Discord rate limited for {retry_after*.1f}s; retry next cycle")
                     return False
                 time.sleep(max(1.0, retry_after + 0.5))
                 continue
